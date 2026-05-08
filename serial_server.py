@@ -403,6 +403,7 @@ class Handler(BaseHTTPRequestHandler):
             sse_unregister(q)
 
     def do_POST(self):
+        global IDF_PATH, IDF_VENV
         parsed = urlparse(self.path)
         path = parsed.path
         body = json.loads(self._read_body()) if self.headers.get("Content-Length", "0") != "0" else {}
@@ -430,12 +431,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/build":
             project = body.get("project_dir", ".")
+            idf_path = body.get("idf_path", "")
+            if idf_path:
+                p = Path(idf_path)
+                if (p / "tools" / "idf.py").exists():
+                    IDF_PATH = str(p.resolve())
+                    IDF_VENV = None  # re-detect venv for new IDF
             result = run_idf_command(["idf.py", "build"], "build", project)
             return self._json(result)
 
         if path == "/api/flash":
             project = body.get("project_dir", ".")
             port = body.get("port", "")
+            idf_path = body.get("idf_path", "")
+            if idf_path:
+                p = Path(idf_path)
+                if (p / "tools" / "idf.py").exists():
+                    IDF_PATH = str(p.resolve())
+                    IDF_VENV = None
             # close serial before flashing (release COM port)
             serial_close()
             time.sleep(0.3)
