@@ -32,7 +32,7 @@ If the user doesn't know, scan common locations:
 - `D:\Programs\esp-idf\`
 - `C:\esp\`
 - `C:\esp-idf\`
-- `C:\Users\zt\esp\`
+- `%USERPROFILE%\esp\`
 
 Look for subdirectories matching `v*.*.*` pattern (e.g. `v5.5.3`, `v5.4.1`).
 
