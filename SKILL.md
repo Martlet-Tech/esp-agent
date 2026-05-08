@@ -15,6 +15,13 @@ metadata:
 
 Automates the ESP-IDF build process on Windows. Handles all the environment quirks: MSYSTEM conflicts, Python venv version mismatches, toolchain PATH setup.
 
+## Files
+
+| File | Purpose |
+|------|---------|
+| `esp_agent.py` | Python CLI script — does the actual detection and build |
+| `SKILL.md` | Skill definition for Claude |
+
 ## Workflow
 
 ### Step 1: Ask for IDF path (if not already known)
@@ -40,32 +47,17 @@ Select the best matching Python venv (match IDF version, prefer any Python 3.x).
 
 ### Step 3: Build the project
 
-Write a batch file to `%TEMP%\esp-agent-build.bat`:
+Run the Python helper script:
 
-```bat
-@echo on
-set MSYSTEM=
-cd /d {project_dir}
-set IDF_PATH={idf_path}
-call {idf_path}\export.bat
-echo ======================================
-echo Building {project_name} ({target})
-echo ======================================
-idf.py build 2>&1
-exit /b %ERRORLEVEL%
+```bash
+python esp_agent.py <project_dir> [--idf-path <idf_path>]
 ```
 
-**Fix Python venv mismatch** — if `export.bat` errors with "Python virtual environment not found":
-1. Check which venvs exist: `dir /b %USERPROFILE%\.espressif\python_env\idf{version}_py3.*_env`
-2. Prepend the found venv to PATH before calling export.bat:
-   ```bat
-   set PATH=%USERPROFILE%\.espressif\python_env\idf{version}_py3.{ver}_env\Scripts;%PATH%
-   ```
-
-Execute via Windows CMD (**must use `//c` flag** from Git Bash, not `/c`):
-```
-cmd.exe '//c' "%TEMP%\esp-agent-build.bat"
-```
+The script handles:
+1. **MSYSTEM** — clears the env var so `export.bat` doesn't bail early
+2. **Python venv** — finds existing venv and prepends to PATH before `export.bat`
+3. **Batch execution** — writes a temp `.bat` and invokes it via `cmd.exe '//c'`
+4. **Build** — runs `idf.py build` with full output streaming
 
 ### Step 4: Report result
 
