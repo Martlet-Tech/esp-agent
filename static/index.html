@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP-Agent Monitor</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column;
+    height: 100vh; overflow: hidden;
+  }
+  header {
+    background: #16213e; padding: 12px 20px; display: flex; align-items: center;
+    gap: 12px; border-bottom: 1px solid #0f3460; flex-shrink: 0;
+  }
+  header h1 { font-size: 18px; font-weight: 600; color: #e94560; }
+  header h1 span { color: #888; font-weight: 400; }
+  .toolbar {
+    display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap;
+  }
+  .toolbar label { font-size: 13px; color: #aaa; }
+  select, button, input {
+    background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a8a;
+    border-radius: 4px; padding: 6px 12px; font-size: 13px; font-family: inherit;
+    cursor: pointer; transition: background .15s;
+  }
+  select:hover, button:hover { background: #1a4a8a; }
+  button:active { transform: scale(.97); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-connect { background: #1b6b3a; border-color: #2a9d5a; }
+  .btn-connect:hover { background: #2a9d5a; }
+  .btn-danger { background: #6b1b1b; border-color: #a52a2a; }
+  .btn-danger:hover { background: #a52a2a; }
+  .btn-action { background: #e94560; border-color: #e94560; color: #fff; font-weight: 600; }
+  .btn-action:hover { background: #ff6b81; }
+  .btn-action:disabled { background: #5a2a30; border-color: #5a2a30; color: #888; }
+
+  .main {
+    display: flex; flex-direction: column; flex: 1; min-height: 0;
+  }
+  #log {
+    flex: 1; overflow-y: auto; padding: 12px 16px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 13px; line-height: 1.55; background: #0d0d1a;
+  }
+  #log .ts { color: #555; font-size: 11px; margin-right: 8px; }
+  #log .build { color: #8ab4f8; }
+  #log .flash { color: #fdd663; }
+  #log .serial { color: #81c995; }
+  #log .system { color: #888; font-style: italic; }
+  #log .error { color: #f28b82; }
+  #log .warn { color: #fdd663; }
+
+  .statusbar {
+    background: #16213e; padding: 6px 16px; font-size: 12px; color: #888;
+    border-top: 1px solid #0f3460; display: flex; gap: 20px; flex-shrink: 0;
+  }
+  .statusbar .dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px;
+  }
+  .dot.green { background: #4caf50; }
+  .dot.red { background: #f44336; }
+  .dot.gray { background: #555; }
+  .dot.yellow { background: #ff9800; }
+
+  .tab-bar { display: flex; background: #16213e; border-bottom: 1px solid #0f3460; flex-shrink: 0; }
+  .tab { padding: 8px 20px; font-size: 13px; cursor: pointer; color: #888;
+          border-bottom: 2px solid transparent; transition: all .15s; }
+  .tab:hover { color: #ccc; }
+  .tab.active { color: #e94560; border-bottom-color: #e94560; }
+
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+  .recording .dot { animation: pulse 1s infinite; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ESP-Agent <span>Monitor</span></h1>
+  <div class="toolbar">
+    <label for="port-select">Port</label>
+    <select id="port-select"><option value="">— scan ports —</option></select>
+    <label for="baud">Baud</label>
+    <select id="baud">
+      <option value="115200" selected>115200</option>
+      <option value="921600">921600</option>
+      <option value="460800">460800</option>
+      <option value="230400">230400</option>
+      <option value="9600">9600</option>
+    </select>
+    <button id="btn-connect" class="btn-connect">Connect</button>
+    <button id="btn-build" class="btn-action">Build</button>
+    <button id="btn-flash" class="btn-action">Flash</button>
+    <button id="btn-clear">Clear</button>
+  </div>
+</header>
+
+<div class="tab-bar">
+  <div class="tab active" data-tab="log">Console</div>
+</div>
+
+<div class="main">
+  <div id="log"></div>
+</div>
+
+<div class="statusbar">
+  <span id="status-port"><span class="dot gray"></span>Disconnected</span>
+  <span id="status-build">Build: —</span>
+  <span id="status-flash">Flash: —</span>
+</div>
+
+<script>
+const BASE = window.location.origin;
+const logEl = document.getElementById('log');
+const portSelect = document.getElementById('port-select');
+const baudSelect = document.getElementById('baud');
+const btnConnect = document.getElementById('btn-connect');
+const btnBuild = document.getElementById('btn-build');
+const btnFlash = document.getElementById('btn-flash');
+const btnClear = document.getElementById('btn-clear');
+const statusPort = document.getElementById('status-port');
+const statusBuild = document.getElementById('status-build');
+const statusFlash = document.getElementById('status-flash');
+
+let connected = false;
+let evtSource = null;
+
+// ── helpers ──────────────────────────────────────────────────────
+function log(type, text) {
+  const el = document.createElement('div');
+  const ts = new Date().toLocaleTimeString();
+  el.innerHTML = `<span class="ts">${ts}</span><span class="${type}">${escapeHtml(text)}</span>`;
+  logEl.appendChild(el);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function setStatus(id, html) { document.getElementById(id).innerHTML = html; }
+
+// ── SSE ──────────────────────────────────────────────────────────
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource(BASE + '/api/events');
+
+  evtSource.addEventListener('system', e => {
+    const d = JSON.parse(e.data);
+    if (d.status === 'connected') log('system', 'SSE connected');
+    if (d.status && d.status.startsWith('build:')) {
+      statusBuild.textContent = 'Build: ' + d.status.replace('build:', '').trim();
+    }
+    if (d.status && d.status.startsWith('flash:')) {
+      statusFlash.textContent = 'Flash: ' + d.status.replace('flash:', '').trim();
+    }
+  });
+
+  evtSource.addEventListener('build', e => {
+    const d = JSON.parse(e.data);
+    if (d.data) log('build', d.data);
+  });
+
+  evtSource.addEventListener('flash', e => {
+    const d = JSON.parse(e.data);
+    if (d.data) log('flash', d.data);
+  });
+
+  evtSource.addEventListener('serial', e => {
+    const d = JSON.parse(e.data);
+    if (d.data) log('serial', d.data);
+    if (d.status === 'connected') {
+      connected = true;
+      btnConnect.textContent = 'Disconnect';
+      btnConnect.className = 'btn-danger';
+      statusPort.innerHTML = `<span class="dot green"></span>${d.port}`;
+    }
+    if (d.status === 'disconnected') {
+      connected = false;
+      btnConnect.textContent = 'Connect';
+      btnConnect.className = 'btn-connect';
+      statusPort.innerHTML = `<span class="dot gray"></span>Disconnected`;
+    }
+    if (d.status === 'error') {
+      log('error', 'Serial error: ' + (d.message || 'unknown'));
+    }
+  });
+
+  evtSource.onerror = () => {
+    log('error', 'SSE connection lost, reconnecting...');
+  };
+}
+
+// ── scan ports ───────────────────────────────────────────────────
+async function scanPorts() {
+  try {
+    const resp = await fetch(BASE + '/api/ports');
+    const ports = await resp.json();
+    portSelect.innerHTML = '<option value="">— select port —</option>';
+    ports.forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.device;
+      opt.textContent = p.device + (p.description ? ' — ' + p.description : '');
+      portSelect.appendChild(opt);
+    });
+    log('system', `Scanned ${ports.length} port(s)`);
+  } catch (e) {
+    log('error', 'Failed to scan ports: ' + e.message);
+  }
+}
+
+// ── actions ──────────────────────────────────────────────────────
+async function toggleConnect() {
+  if (connected) {
+    await fetch(BASE + '/api/monitor/stop', { method: 'POST', body: '{}' });
+    return;
+  }
+  const port = portSelect.value;
+  if (!port) { log('warn', 'Select a port first'); return; }
+  const baud = baudSelect.value;
+  await fetch(BASE + '/api/monitor/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ port, baud: parseInt(baud) }),
+  });
+}
+
+async function doBuild() {
+  btnBuild.disabled = true;
+  log('system', 'Build started...');
+  statusBuild.textContent = 'Build: running...';
+  try {
+    await fetch(BASE + '/api/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_dir: '.' }),
+    });
+  } catch (e) {
+    log('error', 'Build request failed: ' + e.message);
+  }
+  setTimeout(() => btnBuild.disabled = false, 2000);
+}
+
+async function doFlash() {
+  btnFlash.disabled = true;
+  log('system', 'Flash started (serial will disconnect)...');
+  statusFlash.textContent = 'Flash: running...';
+  try {
+    await fetch(BASE + '/api/flash', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_dir: '.' }),
+    });
+  } catch (e) {
+    log('error', 'Flash request failed: ' + e.message);
+  }
+  setTimeout(() => btnFlash.disabled = false, 2000);
+}
+
+// ── init ─────────────────────────────────────────────────────────
+connectSSE();
+scanPorts();
+
+btnConnect.addEventListener('click', toggleConnect);
+btnBuild.addEventListener('click', doBuild);
+btnFlash.addEventListener('click', doFlash);
+btnClear.addEventListener('click', () => { logEl.innerHTML = ''; });
+
+// refresh ports list on focus
+portSelect.addEventListener('focus', scanPorts);
+
+// keyboard shortcuts
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); toggleConnect(); }
+});
+</script>
+</body>
+</html>

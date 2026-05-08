@@ -75,6 +75,35 @@ git clone https://github.com/Martlet-Tech/esp-agent.git
 python esp-agent/esp_agent.py your-esp-project
 ```
 
+## Web Monitor — Watch Serial Output in Browser
+
+Start the serial monitor server for real-time build, flash, and device logs:
+
+```bash
+# Install dependency (once)
+pip install pyserial
+
+# Start the server (uses system Python, not IDF venv)
+python serial_server.py
+```
+
+Open **http://127.0.0.1:8099/** in your browser:
+
+- Select COM port and click **Connect** — see device serial output live
+- Click **Build** — compiles and streams log to browser
+- Click **Flash** — flashes firmware (auto-disconnects serial, reconnects after)
+- Claude (or any agent) talks to the same server via REST API:
+  ```
+  POST /api/build   → start build
+  POST /api/flash   → start flash
+  POST /api/monitor/start  → open serial port
+  POST /api/send    → send data to serial
+  GET  /api/ports   → list available ports
+  GET  /api/events  → SSE stream (used by web UI)
+  ```
+
+Everything the agent does is visible in the browser — no more blind automation.
+
 ## How It Works
 
 ```
@@ -100,10 +129,9 @@ python esp-agent/esp_agent.py your-esp-project
 
 ## Roadmap
 
+- [x] Web monitor UI (serial + build + flash in browser)
+- [x] Flash helper — one-click from browser
 - [ ] Linux / macOS support
-- [ ] Flash helper (`idf.py -p PORT flash`)
-- [ ] Menuconfig launcher
-- [ ] Multi-project batch builds
 
 ## Contributing
 

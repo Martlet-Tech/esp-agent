@@ -53,7 +53,10 @@ def get_python_venv(idf_version: str) -> Path | None:
     espressif_dir = Path.home() / ".espressif" / "python_env"
     if not espressif_dir.exists():
         return None
-    prefix = f"idf{idf_version.replace('v', '')}_py3"
+    # venv dirs use major.minor only (e.g. "idf5.5_py3.10_env"), so strip patch
+    parts = idf_version.replace('v', '').split('.')
+    major_minor = '.'.join(parts[:2])
+    prefix = f"idf{major_minor}_py3"
     for venv_dir in espressif_dir.iterdir():
         if venv_dir.name.startswith(prefix) and venv_dir.is_dir():
             scripts = venv_dir / "Scripts"
