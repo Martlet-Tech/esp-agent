@@ -112,6 +112,9 @@
   <label>IDF Path</label>
   <input id="input-idf-path" type="text" placeholder="auto-detect" spellcheck="false">
   <span class="hint">leave empty to auto-detect</span>
+  <label>Tools Path</label>
+  <input id="input-tools-path" type="text" placeholder="auto-detect" spellcheck="false" style="min-width:180px">
+  <span class="hint">IDF_TOOLS_PATH</span>
   <label>Project</label>
   <input id="input-project-dir" type="text" placeholder="current dir" spellcheck="false">
   <button id="btn-save-config" class="btn-sm">Save</button>
@@ -145,6 +148,7 @@ const statusFlash = document.getElementById('status-flash');
 const statusDir = document.getElementById('status-dir');
 const inputIdfPath = document.getElementById('input-idf-path');
 const inputProjectDir = document.getElementById('input-project-dir');
+const inputToolsPath = document.getElementById('input-tools-path');
 
 let connected = false;
 let evtSource = null;
@@ -154,14 +158,17 @@ function loadConfig() {
   try {
     const idf = localStorage.getItem('esp-agent-idf-path');
     const proj = localStorage.getItem('esp-agent-project-dir');
+    const tools = localStorage.getItem('esp-agent-tools-path');
     if (idf) inputIdfPath.value = idf;
     if (proj) inputProjectDir.value = proj;
+    if (tools) inputToolsPath.value = tools;
   } catch (_) {}
 }
 function saveConfig() {
   try {
     localStorage.setItem('esp-agent-idf-path', inputIdfPath.value);
     localStorage.setItem('esp-agent-project-dir', inputProjectDir.value);
+    localStorage.setItem('esp-agent-tools-path', inputToolsPath.value);
   } catch (_) {}
   log('system', 'Config saved');
   updateDirDisplay();
@@ -269,7 +276,9 @@ async function scanPorts() {
 function buildBody() {
   const body = { project_dir: getProjectDir() };
   const idf = getIdfPath();
+  const tools = inputToolsPath.value.trim() || '';
   if (idf) body.idf_path = idf;
+  if (tools) body.idf_tools_path = tools;
   return JSON.stringify(body);
 }
 

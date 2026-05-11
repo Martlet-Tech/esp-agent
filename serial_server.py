@@ -47,6 +47,8 @@ BUILD_LOG = queue.Queue()                  # build/flash output for agent pollin
 IDF_PATH: str | None = None
 IDF_VENV: str | None = None
 
+HTTP_SERVER: HTTPServer | None = None      # set by main() for /api/shutdown
+
 
 # ── broadcast to all SSE clients ─────────────────────────────────
 def sse_broadcast(event: str, data: dict):
@@ -128,6 +130,233 @@ def detect_target(project_dir: Path) -> str:
     return "unknown"
 
 
+# ── error classification (agent-friendly) ──────────────────────────
+BUILD_ERROR_TYPES = {
+    "toolchain_version_mismatch": {
+        "keywords": ["unsupported non-standard extension"],
+        "suggestion": "Update IDF_TOOLS_PATH to a version matching the IDF version (same major.minor). Re-run the ESP-IDF installer or download matching tools.",
+        "recoverable": False,
+    },
+    "tool_version_mismatch": {
+        "keywords": ["Tool doesn't match supported version from list"],
+        "suggestion": "The compiler found in IDF_TOOLS_PATH doesn't match the version required by this IDF version. This usually happens when IDF_TOOLS_PATH points to a different IDF version's tools. Verify IDF_TOOLS_PATH matches the IDF version and run 'idf.py fullclean'.",
+        "recoverable": True,
+    },
+    "compiler_not_found": {
+        "keywords": ["CMAKE_C_COMPILER", "not found in the PATH"],
+        "suggestion": "IDF_TOOLS_PATH is missing the required toolchain binaries. Check that IDF_TOOLS_PATH points to a complete ESP-IDF tools installation.",
+        "recoverable": True,
+    },
+    "cmake_failed": {
+        "keywords": ["Configuring incomplete, errors occurred!"],
+        "suggestion": "CMake configuration failed. Check the build log for details. Common causes: missing dependencies, stale build directory (run 'idf.py fullclean' or delete build/).",
+        "recoverable": True,
+    },
+    "python_dependency": {
+        "keywords": [["ModuleNotFoundError"], ["No module named"],
+                      ["pip", "requirements"], ["Python virtual environment", "not found"]],
+        "suggestion": "Python environment incomplete. The IDF Python virtual environment is missing or corrupted. Re-run the ESP-IDF installer or install script (install.bat / install.ps1).",
+        "recoverable": True,
+    },
+    "source_compile_error": {
+        "keywords": ["error:", "compilation terminated"],
+        "suggestion": "Source code compilation error. Check the build log for the specific file and line number that failed.",
+        "recoverable": False,
+    },
+}
+
+
+def classify_build_error(output_text: str, target: str = "") -> dict:
+    """
+    Analyze build output and return a structured error classification.
+    Keywords format:
+      - [kw1, kw2]        → ALL must match (AND)
+      - [[a, b], [c]]     → (a AND b) OR (c)
+    """
+    for err_type, info in BUILD_ERROR_TYPES.items():
+        kws = info["keywords"]
+        if kws and isinstance(kws[0], list):
+            # OR-of-ANDs: any group where all keywords match
+            if any(all(kw in output_text for kw in group) for group in kws):
+                return {
+                    "error_type": err_type,
+                    "suggestion": info["suggestion"],
+                    "recoverable": info["recoverable"],
+                }
+        else:
+            # legacy AND: all keywords must match
+            if all(kw in output_text for kw in kws):
+                return {
+                    "error_type": err_type,
+                    "suggestion": info["suggestion"],
+                    "recoverable": info["recoverable"],
+                }
+    return {
+        "error_type": "build_failed",
+        "suggestion": "Build failed. Check the log output above for error messages.",
+        "recoverable": False,
+    }
+
+
+def _extract_version(path: Path) -> str:
+    """Extract a version-ish string from a path name for matching."""
+    for part in path.parts:
+        name = part.lower()
+        if name.startswith("v") and name[1:2].isdigit():
+            return name.lstrip("v")   # "v5.5.3" -> "5.5.3"
+        if name.startswith("tools-"):
+            return name.replace("tools-", "")  # "tools-5.5.2" -> "5.5.2"
+    return ""
+
+
+def check_build_config(project_dir: str, idf_path: str, idf_tools_path: str) -> dict:
+    """
+    Pre-flight check: validate paths and detect issues before building.
+    Resolution order: user-provided → system env → auto-detect.
+    Returns resolved paths + validation results.
+    """
+    checks = []
+    has_error = False
+    error_type = None
+    suggestion = None
+
+    # ── 1. project_dir ──────────────────────────────────────────────
+    proj = Path(project_dir) if project_dir else None
+    cmake = proj / "CMakeLists.txt" if proj else None
+    if not proj or not proj.exists() or not proj.is_dir():
+        checks.append({"check": "project_dir", "status": "fail", "message": f"Project directory not found: {project_dir}"})
+        has_error = True; error_type = "config_invalid"; suggestion = "Check the Project Dir path in the web UI."
+    elif not cmake.exists():
+        checks.append({"check": "project_dir", "status": "fail", "message": f"No CMakeLists.txt found in {project_dir}"})
+        has_error = True; error_type = "config_invalid"; suggestion = "The project directory does not appear to be an ESP-IDF project."
+    else:
+        checks.append({"check": "project_dir", "status": "ok", "message": f"Project at {proj.resolve()}"})
+
+    proj_target = detect_target(proj) if proj and cmake and cmake.exists() else "unknown"
+
+    # ── 2. IDF_PATH: user → env → auto-detect ─────────────────────
+    resolved_idf = None
+    idf_version = None
+    idf_source = "none"
+
+    if idf_path:
+        p = Path(idf_path)
+        if p.exists() and (p / "tools" / "idf.py").exists():
+            resolved_idf, idf_version = p.resolve(), p.parent.name
+            idf_source = "user"
+            checks.append({"check": "idf_path", "status": "ok", "message": f"IDF at {resolved_idf} ({idf_version}) [user]"})
+        else:
+            checks.append({"check": "idf_path", "status": "fail", "message": f"User IDF path invalid: {idf_path}"})
+
+    if not resolved_idf:
+        env_idf = os.environ.get("IDF_PATH", "")
+        if env_idf:
+            ep = Path(env_idf)
+            if ep.exists() and (ep / "tools" / "idf.py").exists():
+                resolved_idf, idf_version = ep.resolve(), ep.parent.name
+                idf_source = "env"
+                checks.append({"check": "idf_path", "status": "ok", "message": f"IDF from env IDF_PATH={resolved_idf} ({idf_version})"})
+
+    if not resolved_idf:
+        found, ver = find_idf()
+        if found:
+            resolved_idf, idf_version = found, ver
+            idf_source = "auto"
+            checks.append({"check": "idf_path", "status": "ok", "message": f"IDF auto-detected at {resolved_idf} ({idf_version})"})
+
+    if not resolved_idf:
+        checks.append({"check": "idf_path", "status": "fail", "message": "No IDF_PATH found (user / env / auto-detect all failed)"})
+        has_error = True; error_type = "config_invalid"; suggestion = "Install ESP-IDF or provide the path in the web UI."
+
+    # ── 3. IDF_TOOLS_PATH: user → env → match IDF version → auto ──
+    resolved_tools = None
+    tools_version = None
+    tools_source = "none"
+
+    if idf_tools_path:
+        tp = Path(idf_tools_path)
+        if tp.exists() and (tp / "tools").is_dir():
+            resolved_tools, tools_version = tp.resolve(), tp.name
+            tools_source = "user"
+            checks.append({"check": "tools_path", "status": "ok", "message": f"Tools at {resolved_tools.name} [user]"})
+        else:
+            checks.append({"check": "tools_path", "status": "fail", "message": f"User tools path invalid: {idf_tools_path}"})
+
+    if not resolved_tools:
+        env_tools = os.environ.get("IDF_TOOLS_PATH", "")
+        if env_tools:
+            etp = Path(env_tools)
+            if etp.exists() and (etp / "tools").is_dir():
+                resolved_tools, tools_version = etp.resolve(), etp.name
+                tools_source = "env"
+                checks.append({"check": "tools_path", "status": "ok", "message": f"Tools from env IDF_TOOLS_PATH={resolved_tools.name}"})
+
+    # ── 4. Cross-validate: IDF version vs tools version ───────────
+    if resolved_idf and resolved_tools:
+        idf_ver = _extract_version(resolved_idf)
+        tools_ver = _extract_version(resolved_tools)
+        if idf_ver and tools_ver and idf_ver != tools_ver:
+            checks.append({"check": "version_match", "status": "warn",
+                "message": f"IDF version '{idf_ver}' != tools version '{tools_ver}' — may cause incompatibility."})
+            if not error_type:
+                error_type = "toolchain_version_mismatch"
+                suggestion = f"IDF ({idf_ver}) and tools ({tools_ver}) versions don't match. Point both to same version."
+
+    # ── 5. Compiler check ─────────────────────────────────────────
+    target_to_prefix = {
+        "esp32": "xtensa-esp-elf", "esp32s2": "xtensa-esp-elf", "esp32s3": "xtensa-esp-elf",
+        "esp32c2": "riscv32-esp-elf", "esp32c3": "riscv32-esp-elf", "esp32c5": "riscv32-esp-elf",
+        "esp32c6": "riscv32-esp-elf", "esp32h2": "riscv32-esp-elf", "esp32p4": "riscv32-esp-elf",
+    }
+    prefix = target_to_prefix.get(proj_target, "riscv32-esp-elf")
+
+    if resolved_tools:
+        tools_dir = resolved_tools / "tools"
+        found_compiler = False
+        for tc_dir in tools_dir.iterdir():
+            if tc_dir.is_dir():
+                for bin_dir in tc_dir.rglob("bin"):
+                    if bin_dir.is_dir():
+                        gcc = bin_dir / f"{prefix}-gcc.exe"
+                        if gcc.exists():
+                            found_compiler = True
+                            checks.append({"check": "compiler", "status": "ok",
+                                "message": f"Found {gcc.name} ({gcc.parent.parent.name})"})
+                            break
+                if found_compiler:
+                    break
+        if not found_compiler:
+            any_gcc = list(tools_dir.rglob("*gcc.exe"))
+            if any_gcc:
+                checks.append({"check": "compiler", "status": "warn",
+                    "message": f"No '{prefix}-gcc' for target '{proj_target}' (other GCC exists — version mismatch?)"})
+                if not error_type:
+                    error_type = "toolchain_version_mismatch"
+                    suggestion = f"Tools version doesn't support target '{proj_target}'. Update to matching tools."
+            else:
+                checks.append({"check": "compiler", "status": "fail", "message": "No GCC compiler found in IDF_TOOLS_PATH."})
+                has_error = True
+                if not error_type:
+                    error_type = "compiler_not_found"
+                    suggestion = "IDF_TOOLS_PATH has no toolchain binaries. Reinstall ESP-IDF tools."
+
+    return {
+        "valid": not has_error,
+        "checks": checks,
+        "error_type": error_type,
+        "suggestion": suggestion,
+        "target": proj_target,
+        "resolved": {
+            "idf_path": str(resolved_idf) if resolved_idf else None,
+            "idf_version": idf_version,
+            "idf_source": idf_source,
+            "idf_tools_path": str(resolved_tools) if resolved_tools else None,
+            "tools_version": tools_version,
+            "tools_source": tools_source,
+        }
+    }
+
+
 # ── serial monitor ───────────────────────────────────────────────
 def _monitor_loop(port_name: str, baud: int):
     """Background thread — reads serial and broadcasts via SSE."""
@@ -206,22 +435,18 @@ def serial_send(text: str):
 def serial_reset() -> bool:
     """
     Hardware reset without going into download mode.
-
-    DTR → EN (inverted transistor): DTR=True → EN low → reset
-    RTS → GPIO0 (inverted transistor): RTS=True → GPIO0 low → download
+    DTR -> EN (inverted transistor): DTR=True -> EN low -> reset
+    RTS -> GPIO0 (inverted transistor): RTS=True -> GPIO0 low -> download
     """
     with SERIAL_LOCK:
         if SERIAL_PORT and SERIAL_PORT.is_open:
             try:
-                # Idle: no reset, normal boot
-                SERIAL_PORT.dtr = False   # EN high
-                SERIAL_PORT.rts = False   # GPIO0 high
+                SERIAL_PORT.dtr = False
+                SERIAL_PORT.rts = False
                 time.sleep(0.05)
-                # Pulse reset: EN low, GPIO0 stays high
-                SERIAL_PORT.dtr = True    # EN low → reset
+                SERIAL_PORT.dtr = True
                 time.sleep(0.15)
-                # Release: EN high, GPIO0 still high → boot from flash
-                SERIAL_PORT.dtr = False   # EN high
+                SERIAL_PORT.dtr = False
                 time.sleep(0.05)
                 return True
             except Exception:
@@ -230,11 +455,12 @@ def serial_reset() -> bool:
 
 
 # ── subprocess runner (build / flash) ────────────────────────────
-def run_idf_command(cmd: list[str], label: str, project_dir: str) -> dict:
+def run_idf_command(cmd: list[str], label: str, project_dir: str,
+                    idf_tools_path: str | None = None) -> dict:
     """
     Run an idf.py subprocess with proper IDF environment (MSYSTEM fix,
     Python venv, export.bat).  Streams output via SSE in real-time.
-    Returns {"status": "ok"|"fail", "exit_code": N, "output": [...]}.
+    Returns agent-friendly dict with error classification.
     """
     global IDF_PATH, IDF_VENV
     sse_broadcast("system", {"status": f"{label}: starting"})
@@ -262,12 +488,11 @@ def run_idf_command(cmd: list[str], label: str, project_dir: str) -> dict:
     # build a temporary batch file with full IDF environment setup
     batch_lines = ["@echo on", "set MSYSTEM="]
     if IDF_VENV:
-        # Prepend venv to PATH so python resolves to the right version;
-        # also set IDF_PYTHON_ENV_PATH so idf_tools uses the existing venv
-        # instead of checking for a non-existent one (e.g. py3.14).
         batch_lines.append(f"set PATH={IDF_VENV};%PATH%")
         idf_python_env = str(Path(IDF_VENV).parent)
         batch_lines.append(f"set IDF_PYTHON_ENV_PATH={idf_python_env}")
+    if idf_tools_path:
+        batch_lines.append(f"set IDF_TOOLS_PATH={idf_tools_path}")
     batch_lines.append(f"cd /d {project}")
     batch_lines.append(f"set IDF_PATH={IDF_PATH}")
     batch_lines.append(f"call {IDF_PATH}\\export.bat")
@@ -299,9 +524,21 @@ def run_idf_command(cmd: list[str], label: str, project_dir: str) -> dict:
 
         proc.wait()
         ok = proc.returncode == 0
+
+        # classify errors for agent-friendly response
+        full_output = "\n".join(lines)
+        error_info = classify_build_error(full_output, target) if not ok else {}
+        if error_info.get("error_type"):
+            diag = f"[{error_info['error_type']}] {error_info['suggestion']}"
+            sse_broadcast("system", {"status": f"[diagnostic] {diag}"})
+            lines.append(f"[diagnostic] {diag}")
+
         status = "success" if ok else f"failed (exit {proc.returncode})"
         sse_broadcast("system", {"status": f"{label}: {status}"})
-        return {"status": "ok" if ok else "fail", "exit_code": proc.returncode, "output": lines}
+        return {"status": "ok" if ok else "fail", "exit_code": proc.returncode,
+                "output": lines, "error_type": error_info.get("error_type"),
+                "suggestion": error_info.get("suggestion"),
+                "recoverable": error_info.get("recoverable")}
     except Exception as e:
         sse_broadcast("system", {"status": f"{label}: error — {e}"})
         return {"status": "error", "exit_code": -1, "output": lines}
@@ -329,7 +566,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        # simple content-type map
         ext_map = {".html": "text/html", ".js": "application/javascript",
                    ".css": "text/css", ".png": "image/png", ".ico": "image/x-icon"}
         ctype = ext_map.get(filepath.suffix, "application/octet-stream")
@@ -385,7 +621,6 @@ class Handler(BaseHTTPRequestHandler):
 
         q = sse_register()
         try:
-            # send an initial connected event
             self.wfile.write(b"event: system\ndata: {\"status\": \"connected\"}\n\n")
             self.wfile.flush()
 
@@ -429,31 +664,46 @@ class Handler(BaseHTTPRequestHandler):
             ok = serial_reset()
             return self._json({"reset": ok})
 
+        if path == "/api/check-config":
+            project = body.get("project_dir", ".")
+            idf_path = body.get("idf_path", "")
+            idf_tools_path = body.get("idf_tools_path", "")
+            result = check_build_config(project, idf_path, idf_tools_path)
+            return self._json(result)
+
+        if path == "/api/shutdown":
+            serial_close()
+            threading.Thread(target=lambda: HTTP_SERVER.shutdown(), daemon=True).start()
+            return self._json({"status": "shutting down"})
+
         if path == "/api/build":
             project = body.get("project_dir", ".")
             idf_path = body.get("idf_path", "")
+            idf_tools_path = body.get("idf_tools_path", "")
             if idf_path:
                 p = Path(idf_path)
                 if (p / "tools" / "idf.py").exists():
                     IDF_PATH = str(p.resolve())
-                    IDF_VENV = None  # re-detect venv for new IDF
-            result = run_idf_command(["idf.py", "build"], "build", project)
+                    IDF_VENV = None
+            result = run_idf_command(["idf.py", "build"], "build", project,
+                                     idf_tools_path=idf_tools_path or None)
             return self._json(result)
 
         if path == "/api/flash":
             project = body.get("project_dir", ".")
             port = body.get("port", "")
             idf_path = body.get("idf_path", "")
+            idf_tools_path = body.get("idf_tools_path", "")
             if idf_path:
                 p = Path(idf_path)
                 if (p / "tools" / "idf.py").exists():
                     IDF_PATH = str(p.resolve())
                     IDF_VENV = None
-            # close serial before flashing (release COM port)
             serial_close()
             time.sleep(0.3)
             cmd = ["idf.py", "-p", port, "flash"] if port else ["idf.py", "flash"]
-            result = run_idf_command(cmd, "flash", project)
+            result = run_idf_command(cmd, "flash", project,
+                                     idf_tools_path=idf_tools_path or None)
             return self._json(result)
 
         return self._json({"error": "not found"}, 404)
@@ -490,10 +740,12 @@ def main():
             print(f"  WARNING: --idf-path {args.idf_path} invalid (no tools/idf.py)")
 
     server = ThreadedHTTPServer((args.host, args.port), Handler)
+    global HTTP_SERVER
+    HTTP_SERVER = server
     print(f"\n  ESP-Agent Serial Server running at:")
     print(f"  http://{args.host}:{args.port}/")
-    print(f"\n  Web UI  →  http://{args.host}:{args.port}/")
-    print(f"  API     →  http://{args.host}:{args.port}/api/ports")
+    print(f"\n  Web UI  ->  http://{args.host}:{args.port}/")
+    print(f"  API     ->  http://{args.host}:{args.port}/api/ports")
     print(f"\n  Press Ctrl+C to stop.\n")
 
     try:
